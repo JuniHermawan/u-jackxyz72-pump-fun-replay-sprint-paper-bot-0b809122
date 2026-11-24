@@ -1,478 +1,570 @@
-// Survivor breakout — pump.fun bonding-curve paper bot, agent-fun/replay/v2.
+// Survivor-breakout paper bot (rewrite, 24 Nov 2026).
 //
-// Idea (original; differs from the kit pilots): do NOT buy launches and do
-// NOT buy dips. Buy only coins that have already survived their first
-// minutes and proven real demand, then ride the breakout:
+// Idea, in one paragraph: most pump.fun coins die young, and the ones that
+// complete do it in their first slot, before our 2-slot latency can reach
+// them - so do not chase completes or early momentum. Buy only coins that
+// have already proven real demand by surviving a while: old enough, a
+// healthy amount of real SOL in the curve (not too little, not overheated),
+// many distinct buyers, net SOL flowing in, no single buyer dominating,
+// price still near its high, and a creator who has never sold. One small
+// buy per coin, then purely mechanical exits: a tight stop, a take profit,
+// a trailing stop off the peak, a creator-sell exit, a stale exit and a
+// maximum hold. Everything is deterministic: no clock, no randomness, no
+// I/O; iteration follows first-seen order and sells are sorted by mint.
 //
-//   - old enough to have a tape (age >= minAge slots since CreateEvent),
-//     young enough that the run is not over (age <= maxAge),
-//   - real SOL reserves already meaningful and still pre-graduation
-//     (minRqSol..maxRqSol): buyers have put real money in,
-//   - broad demand: at least minBuyers distinct buyers, net SOL inflow
-//     (buys minus sells) at least minNetSol, and no single buyer over
-//     maxTopBuyerShare of all buy SOL (a launch bundled by one wallet
-//     is a dump in waiting),
-//   - price within (1 - maxDd) of its high since creation: the coin is
-//     at/near its high, not bouncing off a collapse,
-//   - the creator has never sold.
-//
-// One buy per coin, small and fixed (stakeSol, capped by the harness's
-// 1%-of-real-reserve size cap and by cash). Exits are mechanical: a stop
-// loss against cost, a trailing stop once the position is up, a take
-// profit, a creator-sell exit, a stale exit, and a hard time limit. A
-// curve that completes is closed by the replay at its final reserves.
-//
-// Calibration (dev window, tools/sim.ts offline port + grade-local):
-//   - At age 50 slots the entry rule selects ~122 of 1222 coins; of
-//     those, 29 go on to >=2x their entry price, 44 to >=1.5x, only 11
-//     ever fall below entry — against the sniper pilot's 46 wins / 299
-//     losses on the same window. The rule is structural (real SOL +
-//     breadth + flow), not a fitted grid cell.
-//   - v1 (this file): single 0.1 SOL buy, SL -20%, trail -30% armed at
-//     +40%, TP +100%, max hold 2500 slots. Dev: -1.51 SOL.
-//   - The calibration that followed (v2-v56, each measured on the dev
-//     window with the offline sim port; the full log is in NOTES):
-//     tight stops beat wide ones (a -10% stop cuts the -33% average
-//     loss to -18%); small stakes beat big ones (0.015 SOL: less price
-//     impact per trade); entering later beats entering early (minAge 100
-//     instead of 20: the youngest spikes are noise); a short maxHold
-//     (1500 slots) beats a long one; and capping real SOL at 20 removes
-//     the overheated giants — the 3 biggest losers of v48 all entered at
-//     rq ~46, buyers ~76, price exactly at their high.
-//     The shipped settings are v56. Dev (offline sim, all 3 parts):
-//     +0.0029 SOL, 59 trips, 9 wins, 0 trips worse than -0.01 SOL,
-//     max drawdown 0.6%, 59 distinct mints (guardrail: >= 20).
-//     The margin is a hair above zero: the dev window is nearly
-//     efficient after fees, and the final window is a different 24h —
-//     the stress run decides whether this is robust or a coin flip.
-//
-// Deterministic by construction: no clock, no randomness, no I/O;
-// iteration only over insertion-ordered maps fed by the batch stream,
-// plus sorted held-mint lists for exits.
+// Money is bigint lamports; prices are plain numbers (virtual quote per
+// virtual token) used only for ratio comparisons against thresholds.
+import type { Batch, Bot, BotState, OrderInput } from './vendor/makefun-bot.ts';
 
-import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
-
-export interface Params {
-  /** Slots since CreateEvent before an entry is allowed. */
-  minAge: number;
-  /** Slots since CreateEvent after which no first entry is allowed. */
-  maxAge: number;
-  /** Real SOL reserve window at decision time. */
-  minRqSol: number;
-  maxRqSol: number;
-  /** Distinct buyers (all time) required. */
+export interface SurvivorParams {
+  /** Minimum coin age in slots before it may be bought. */
+  minAgeSlots: number;
+  /** Real SOL in the curve at buy time must lie in [minRealSol, maxRealSol]. */
+  minRealSol: number;
+  maxRealSol: number;
+  /** Minimum distinct buyers seen on the coin. */
   minBuyers: number;
-  /** Net SOL inflow (buys minus sells, all time) required. */
+  /** Minimum net SOL inflow (buys minus sells) seen on the coin. */
   minNetSol: number;
-  /** Largest single buyer's share of all buy SOL, at most. */
-  maxTopBuyerShare: number;
-  /** Price must be at least this share of its high since creation. */
-  minNearHigh: number;
-  /** ...and at most this share: buying exactly at the high (1.00) is
-      buying the top of a blow-off; the winners enter ~10% off it. */
-  maxNearHigh: number;
-  /** Creator sold before entry: skip the coin. */
-  skipDevSold: boolean;
-  /** SOL to put into one position (one buy; the 1% reserve cap applies). */
+  /** No single buyer may account for more than this share of buy volume. */
+  maxSingleBuyerShare: number;
+  /** Buy only while the mark is at least this fraction of the coin's high. */
+  minPriceVsHigh: number;
+  /** SOL spent per buy (before curve fees). */
   stakeSol: number;
-  /** Smallest buy worth sending. */
-  minBuySol: number;
-  /** Slippage on buys (bps); sells always go out at 10000. */
-  buySlipBps: number;
-  /** Exits. */
-  stopLoss: number;
-  trail: number;
-  /** The trailing stop arms once value reached cost * (1 + trailArm). */
-  trailArm: number;
-  /** Take profit: sell all once value reaches cost * (1 + takeProfit). */
-  takeProfit: number;
-  /** First take-profit: sell tp1Part of the tokens once value reaches
-      cost * (1 + tp1); the rest rides on. 0 = off. */
-  tp1: number;
-  tp1Part: number;
-  /** Entry also needs CURRENT demand: net SOL inflow over the last
-      flowWindow slots at least minRecentFlowSol, from at least
-      minRecentBuyers distinct buyers. */
-  flowWindow: number;
-  minRecentFlowSol: number;
-  minRecentBuyers: number;
-  /** Exit after this many slots held. */
-  maxHold: number;
-  /** Exit when the creator sells while held. */
-  exitOnDevSell: boolean;
-  /** Exit when no trade has hit the coin for this many slots. */
+  /** Sell when the mark falls this far below the entry price. */
+  stopLossPct: number;
+  /** Sell when the mark rises this far above the entry price. */
+  takeProfitPct: number;
+  /** Sell when the mark falls this far below the best price since entry. */
+  trailingDropPct: number;
+  /** Sell after holding this many slots, whatever the price. */
+  maxHoldSlots: number;
+  /** Sell when the coin has not traded for this many slots. */
   staleSlots: number;
-  /** Most main positions open at once. */
-  maxMain: number;
-  /** Most SOL at cost across all positions at once (a drawdown guard). */
-  maxExposureSol: number;
+  /** Slippage tolerance on every order, in basis points. */
+  maxSlippageBps: number;
+  /** Buy slippage (default: maxSlippageBps). Tight buys filter bad fills. */
+  buySlippageBps?: number;
+  /** Sell slippage (default: maxSlippageBps). Wide sells exit on time. */
+  sellSlippageBps?: number;
+  /**
+   * Trailing stop only arms once the peak is this far above entry
+   * (0 = armed from entry). Lets a fresh position breathe before the
+   * trail can cut it.
+   */
+  trailArmPct?: number;
+  /**
+   * How the entry price is measured: 'cost' = filled cost per token
+   * (fees included), 'decision' = the mark when the buy was decided.
+   */
+  entryPriceMode: 'cost' | 'decision';
+  /**
+   * Which reserves define "price" for the ENTRY filter (the 85%-of-high
+   * check and the recorded high): 'virtual' = virtual quote per virtual
+   * token (the execution price), 'real' = real quote per real token.
+   * The two move differently because the virtual offsets dampen moves,
+   * so the choice changes how strict the filter is.
+   */
+  priceMode: 'virtual' | 'real';
+  /**
+   * Which reserves define "price" for EXITS (stop / take profit /
+   * trailing stop) and the entry-price measurement. Defaults to
+   * 'virtual', the execution price: real prices are far jumpier, so a
+   * trailing stop measured on them cuts winners early.
+   */
+  exitPriceMode?: 'virtual' | 'real';
+  /** Age counts from 'create' (CreateEvent slot) or 'trade' (first trade). */
+  ageFrom: 'create' | 'trade';
 }
 
-export const DEFAULT_PARAMS: Params = {
-  minAge: 100,
-  maxAge: 400,
-  minRqSol: 5,
-  maxRqSol: 20,
-  minBuyers: 15,
+export const DEFAULT_PARAMS: SurvivorParams = {
+  // v56 base (age 100, real SOL 5-20, buyers 15, net 3, share 0.40,
+  // 85% of high, stake 0.015, stop -10%, TP +75%, trail 0.30, hold 1500,
+  // stale 300) re-tuned by a small offline sweep on the dev window:
+  // the 85%-of-high check and the exits are sharpest on REAL reserves
+  // (virtual offsets dampen moves and let weak coins in), the crowd
+  // filter wants 30 distinct buyers with no one over 30%, sells need a
+  // wide slippage so exits execute on time (buys stay tight at 500),
+  // and a bigger stake amortises the fixed per-trade tx fees.
+  minAgeSlots: 100,
+  minRealSol: 5,
+  maxRealSol: 20,
+  minBuyers: 30,
   minNetSol: 3,
-  maxTopBuyerShare: 0.4,
-  minNearHigh: 0.85,
-  maxNearHigh: 1.0,
-  skipDevSold: true,
-  stakeSol: 0.015,
-  minBuySol: 0.01,
-  buySlipBps: 500,
-  stopLoss: 0.1,
-  trail: 0.3,
-  trailArm: 0.3,
-  takeProfit: 0.75,
-  tp1: 0,
-  tp1Part: 0,
-  flowWindow: 150,
-  minRecentFlowSol: 0,
-  minRecentBuyers: 0,
-  maxHold: 1500,
-  exitOnDevSell: true,
-  staleSlots: 800,
-  maxMain: 5,
-  maxExposureSol: 1.0,
+  maxSingleBuyerShare: 0.3,
+  minPriceVsHigh: 0.85,
+  stakeSol: 0.04,
+  stopLossPct: 0.1,
+  takeProfitPct: 0.75,
+  trailingDropPct: 0.35,
+  maxHoldSlots: 1500,
+  staleSlots: 600,
+  maxSlippageBps: 500,
+  sellSlippageBps: 10000,
+  entryPriceMode: 'cost',
+  priceMode: 'real',
+  ageFrom: 'create',
 };
 
-export const PARAMS: Record<string, Params> = {
-  v1: { ...DEFAULT_PARAMS },
-  v2: { ...DEFAULT_PARAMS, takeProfit: 1.5 },
-  v3: { ...DEFAULT_PARAMS, takeProfit: 1.5, trailArm: 0.25, trail: 0.25 },
-  v4: { ...DEFAULT_PARAMS, takeProfit: 1.5, minBuyers: 12, minNetSol: 2, maxAge: 600 },
-  v5: { ...DEFAULT_PARAMS, takeProfit: 1.5, trailArm: 0.25, trail: 0.25, minBuyers: 12, minNetSol: 2, maxAge: 600 },
-  // v6: wide-stop hold — let runners run to completion; losers are cut at
-  // -50% instead of -20% (memecoin noise is wider than 20%).
-  v6: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.4, trailArm: 1.0, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.05 },
-  // v7: tight trailing stop armed early — exit on the first 12% fade.
-  v7: { ...DEFAULT_PARAMS, stopLoss: 0.2, trail: 0.12, trailArm: 0.15, takeProfit: 1.0 },
-  // v8: v1 exits, but buys refuse to chase spikes (500bps slippage).
-  v8: { ...DEFAULT_PARAMS, buySlipBps: 500 },
-  // v9: v6 exits on a smaller stake (0.03 SOL): losers cost less.
-  v9: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.4, trailArm: 1.0, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03 },
-  // v10: tighter stop (-12%) with v1's other exits.
-  v10: { ...DEFAULT_PARAMS, stopLoss: 0.12, takeProfit: 1.5 },
-  // v11: hold-to-the-moon — no fixed TP, very wide trail, long hold.
-  v11: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.5, trailArm: 1.0, takeProfit: 10.0, maxHold: 10000, stakeSol: 0.03 },
-  // v12: v11 but enter later (minAge 100) — more proven demand.
-  v12: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.5, trailArm: 1.0, takeProfit: 10.0, maxHold: 10000, stakeSol: 0.03, minAge: 100 },
-  // v13: v9 exits + tight buy slippage (don't chase spikes).
-  v13: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.4, trailArm: 1.0, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500 },
-  // v14: v13 + tighter trail (0.20) armed earlier (0.30).
-  v14: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.2, trailArm: 0.3, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500 },
-  // v15: v13 + trail 0.25 armed at +50%.
-  v15: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.25, trailArm: 0.5, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500 },
-  // v16: v13 + partial TP (bank half at +100%, rest rides).
-  v16: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.4, trailArm: 1.0, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, tp1: 1.0, tp1Part: 0.5 },
-  // v17: v13 + partial TP at +50% + tighter trail.
-  v17: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.25, trailArm: 0.3, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, tp1: 0.5, tp1Part: 0.5 },
-  // v18: v16 + tighter stop (-25%): losers bleed less.
-  v18: { ...DEFAULT_PARAMS, stopLoss: 0.25, trail: 0.4, trailArm: 1.0, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, tp1: 1.0, tp1Part: 0.5 },
-  // v19: v16 + current-demand filter (net +1 SOL / 5 buyers over 150 slots).
-  v19: { ...DEFAULT_PARAMS, stopLoss: 0.5, trail: 0.4, trailArm: 1.0, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, tp1: 1.0, tp1Part: 0.5, minRecentFlowSol: 1.0, minRecentBuyers: 5 },
-  // v20: v19 + tighter stop (-25%).
-  v20: { ...DEFAULT_PARAMS, stopLoss: 0.25, trail: 0.4, trailArm: 1.0, takeProfit: 3.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, tp1: 1.0, tp1Part: 0.5, minRecentFlowSol: 1.0, minRecentBuyers: 5 },
-  // v21: tight stop (-10%) + TP +75% (offline grid's best cell: +2.7%/trade).
-  v21: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.4, trailArm: 1.0, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500 },
-  // v22: tight stop (-10%) + TP +100% + partial TP at +100%.
-  v22: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.4, trailArm: 1.0, takeProfit: 1.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, tp1: 1.0, tp1Part: 0.5 },
-  // v23: stop -15% + TP +75%.
-  v23: { ...DEFAULT_PARAMS, stopLoss: 0.15, trail: 0.4, trailArm: 1.0, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500 },
-  // v24: stop -10% + tight trail (0.25 armed at +30%) + TP +75%.
-  v24: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500 },
-  // v25: v21 + bigger stake (0.10 SOL): fixed tx fees shrink as a share.
-  v25: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.4, trailArm: 1.0, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.10, buySlipBps: 500 },
-  // v26: v21 + bigger stake + tighter buy slippage (250bps).
-  v26: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.4, trailArm: 1.0, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.10, buySlipBps: 250 },
-  // v27: v24 + bigger stake (0.10 SOL).
-  v27: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.10, buySlipBps: 500 },
-  // v28: v24 + strength-ordered entries (strongest signals take slots first).
-  v28: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500 },
-  // v29: v28 + minAge 50 (skip the youngest, noisiest entries).
-  v29: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 50 },
-  // v30: v28 + current-demand filter.
-  v30: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minRecentFlowSol: 1.0, minRecentBuyers: 5 },
-  // v31: v29 + minAge 100.
-  v31: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100 },
-  // v32: v29 + minAge 150.
-  v32: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 150 },
-  // v33: v29 + maxAge 200 (enter only at 50-200 slots).
-  v33: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 50, maxAge: 200 },
-  // v34: minAge 100 + maxAge 300.
-  v34: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100, maxAge: 300 },
-  // v35: v31 + TP +100% (let winners run further).
-  v35: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 1.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100 },
-  // v36: v31 + looser trail (0.30).
-  v36: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100 },
-  // v37: v31 + stricter entry (buyers 20, net 5 SOL).
-  v37: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100, minBuyers: 20, minNetSol: 5 },
-  // v38: v31 + TP +100% + stricter entry.
-  v38: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.25, trailArm: 0.3, takeProfit: 1.0, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100, minBuyers: 20, minNetSol: 5 },
-  // v39: v31 + loose trail (0.50 armed at +50%) + TP +150%.
-  v39: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.50, trailArm: 0.5, takeProfit: 1.5, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100 },
-  // v40: v11 exits at minAge 100 (trail 0.50 armed +100%, TP +300%).
-  v40: { ...DEFAULT_PARAMS, stopLoss: 0.50, trail: 0.50, trailArm: 1.0, takeProfit: 3.0, maxHold: 10000, stakeSol: 0.03, buySlipBps: 500, minAge: 100 },
-  // v41: v36 + fast stale exit (300 slots) + maxHold 2000.
-  v41: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 2000, stakeSol: 0.03, buySlipBps: 500, minAge: 100, staleSlots: 300 },
-  // v42: v36 + maxHold 1500.
-  v42: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.03, buySlipBps: 500, minAge: 100 },
-  // v43: v36 with the stop effectively off (-50%): only trail/TP/time exit.
-  v43: { ...DEFAULT_PARAMS, stopLoss: 0.50, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 5000, stakeSol: 0.03, buySlipBps: 500, minAge: 100 },
-  // v44: v42 + partial TP (bank half at +75%).
-  v44: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.03, buySlipBps: 500, minAge: 100, tp1: 0.75, tp1Part: 0.5 },
-  // v45: v42 + smaller stake (0.02 SOL).
-  v45: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.02, buySlipBps: 500, minAge: 100 },
-  // v46: v42 + tighter buy slippage (250bps).
-  v46: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.03, buySlipBps: 250, minAge: 100 },
-  // v47: v42 + minAge 120, maxAge 300.
-  v47: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.03, buySlipBps: 500, minAge: 120, maxAge: 300 },
-  // v48: v45 + stake 0.015 SOL.
-  v48: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.015, buySlipBps: 500, minAge: 100 },
-  // v49: v45 + stake 0.01 SOL (the guardrail floor for a round trip).
-  v49: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.01, buySlipBps: 500, minAge: 100 },
-  // v50: v45 + minAge 80 (a few more entries at the small stake).
-  v50: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.02, buySlipBps: 500, minAge: 80 },
-  // v51: v48 + cap real SOL at 25 (the hottest giants dump hardest).
-  v51: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.015, buySlipBps: 500, minAge: 100, maxRqSol: 25 },
-  // v52: v51 + don't buy exactly at the high (max 0.97 of high).
-  v52: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.015, buySlipBps: 500, minAge: 100, maxRqSol: 25, maxNearHigh: 0.97 },
-  // v53: v48 + maxNearHigh 0.97 alone.
-  v53: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.015, buySlipBps: 500, minAge: 100, maxNearHigh: 0.97 },
-  // v54: v51 + stake 0.02 SOL.
-  v54: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.02, buySlipBps: 500, minAge: 100, maxRqSol: 25 },
-  // v55: v51 + TP +100%.
-  v55: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 1.0, maxHold: 1500, stakeSol: 0.015, buySlipBps: 500, minAge: 100, maxRqSol: 25 },
-  // v56: v51 + maxRqSol 20.
-  v56: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.015, buySlipBps: 500, minAge: 100, maxRqSol: 20 },
-  // v57: v51 + maxRqSol 30.
-  v57: { ...DEFAULT_PARAMS, stopLoss: 0.10, trail: 0.30, trailArm: 0.3, takeProfit: 0.75, maxHold: 1500, stakeSol: 0.015, buySlipBps: 500, minAge: 100, maxRqSol: 30 },
+// Small named alternates for offline tuning; `default` is what ships.
+export const PARAMS: Record<string, SurvivorParams> = {
+  default: DEFAULT_PARAMS,
+  age150: { ...DEFAULT_PARAMS, minAgeSlots: 150 },
+  tightStop: { ...DEFAULT_PARAMS, stopLossPct: 0.08 },
+  wideTrail: { ...DEFAULT_PARAMS, trailingDropPct: 0.4 },
+  stake001: { ...DEFAULT_PARAMS, stakeSol: 0.01 },
+  tp100: { ...DEFAULT_PARAMS, takeProfitPct: 1.0 },
+  stale600: { ...DEFAULT_PARAMS, staleSlots: 600 },
+  cap30: { ...DEFAULT_PARAMS, maxRealSol: 30 },
+  age150: { ...DEFAULT_PARAMS, minAgeSlots: 150 },
+  age200: { ...DEFAULT_PARAMS, minAgeSlots: 200 },
+  buyers20: { ...DEFAULT_PARAMS, minBuyers: 20 },
+  buyers25: { ...DEFAULT_PARAMS, minBuyers: 25 },
+  net5: { ...DEFAULT_PARAMS, minNetSol: 5 },
+  net8: { ...DEFAULT_PARAMS, minNetSol: 8 },
+  cap15: { ...DEFAULT_PARAMS, maxRealSol: 15 },
+  cap12: { ...DEFAULT_PARAMS, maxRealSol: 12 },
+  vsHigh90: { ...DEFAULT_PARAMS, minPriceVsHigh: 0.9 },
+  vsHigh95: { ...DEFAULT_PARAMS, minPriceVsHigh: 0.95 },
+  share30: { ...DEFAULT_PARAMS, maxSingleBuyerShare: 0.3 },
+  combo1: { ...DEFAULT_PARAMS, minAgeSlots: 150, minBuyers: 20, minNetSol: 5 },
+  combo2: { ...DEFAULT_PARAMS, minAgeSlots: 150, maxRealSol: 15, minPriceVsHigh: 0.9 },
+  combo3: { ...DEFAULT_PARAMS, minBuyers: 20, minNetSol: 5, maxRealSol: 15 },
+  combo4: { ...DEFAULT_PARAMS, minAgeSlots: 150, minBuyers: 20, minNetSol: 5, maxRealSol: 15 },
+  combo5: { ...DEFAULT_PARAMS, minAgeSlots: 200, minBuyers: 20, minNetSol: 5 },
+  trail020: { ...DEFAULT_PARAMS, trailingDropPct: 0.2 },
+  stop008: { ...DEFAULT_PARAMS, stopLossPct: 0.08 },
+  slip1000: { ...DEFAULT_PARAMS, maxSlippageBps: 1000 },
+  slip2000: { ...DEFAULT_PARAMS, maxSlippageBps: 2000 },
+  slipMax: { ...DEFAULT_PARAMS, maxSlippageBps: 10000 },
+  decPrice: { ...DEFAULT_PARAMS, entryPriceMode: 'decision' },
+  decPriceSlip: { ...DEFAULT_PARAMS, entryPriceMode: 'decision', maxSlippageBps: 2000 },
+  decPriceCombo: { ...DEFAULT_PARAMS, entryPriceMode: 'decision', minBuyers: 20, minNetSol: 5, maxRealSol: 15 },
+  priceReal: { ...DEFAULT_PARAMS, priceMode: 'real' },
+  priceRealDec: { ...DEFAULT_PARAMS, priceMode: 'real', entryPriceMode: 'decision' },
+  ageTrade: { ...DEFAULT_PARAMS, ageFrom: 'trade' },
+  priceRealAgeTrade: { ...DEFAULT_PARAMS, priceMode: 'real', ageFrom: 'trade' },
+  priceRealCombo: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 20, minNetSol: 5 },
+  prBuyers20: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 20 },
+  prBuyers25: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25 },
+  prNet5: { ...DEFAULT_PARAMS, priceMode: 'real', minNetSol: 5 },
+  prNet8: { ...DEFAULT_PARAMS, priceMode: 'real', minNetSol: 8 },
+  prAge150: { ...DEFAULT_PARAMS, priceMode: 'real', minAgeSlots: 150 },
+  prAge200: { ...DEFAULT_PARAMS, priceMode: 'real', minAgeSlots: 200 },
+  prCap15: { ...DEFAULT_PARAMS, priceMode: 'real', maxRealSol: 15 },
+  prVs90: { ...DEFAULT_PARAMS, priceMode: 'real', minPriceVsHigh: 0.9 },
+  prStop008: { ...DEFAULT_PARAMS, priceMode: 'real', stopLossPct: 0.08 },
+  prStop015: { ...DEFAULT_PARAMS, priceMode: 'real', stopLossPct: 0.15 },
+  prTp100: { ...DEFAULT_PARAMS, priceMode: 'real', takeProfitPct: 1.0 },
+  prTp050: { ...DEFAULT_PARAMS, priceMode: 'real', takeProfitPct: 0.5 },
+  prTrail020: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.2 },
+  prTrail040: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.4 },
+  prStake001: { ...DEFAULT_PARAMS, priceMode: 'real', stakeSol: 0.01 },
+  prStake002: { ...DEFAULT_PARAMS, priceMode: 'real', stakeSol: 0.02 },
+  prStake003: { ...DEFAULT_PARAMS, priceMode: 'real', stakeSol: 0.03 },
+  prComboA: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 20, minNetSol: 5, minAgeSlots: 150 },
+  prComboB: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, minNetSol: 5, minAgeSlots: 150, maxRealSol: 15 },
+  prComboC: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 20, minAgeSlots: 150 },
+  prHold1000: { ...DEFAULT_PARAMS, priceMode: 'real', maxHoldSlots: 1000 },
+  prHold2500: { ...DEFAULT_PARAMS, priceMode: 'real', maxHoldSlots: 2500 },
+  prStale600: { ...DEFAULT_PARAMS, priceMode: 'real', staleSlots: 600 },
+  prNoStale: { ...DEFAULT_PARAMS, priceMode: 'real', staleSlots: 100000 },
+  prShare30: { ...DEFAULT_PARAMS, priceMode: 'real', maxSingleBuyerShare: 0.3 },
+  sellSlip2000: { ...DEFAULT_PARAMS, sellSlippageBps: 2000 },
+  sellSlipMax: { ...DEFAULT_PARAMS, sellSlippageBps: 10000 },
+  prSellSlip: { ...DEFAULT_PARAMS, priceMode: 'real', sellSlippageBps: 2000 },
+  prSellSlipMax: { ...DEFAULT_PARAMS, priceMode: 'real', sellSlippageBps: 10000 },
+  prBuyers25Sell: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 2000 },
+  prBuyers25SellMax: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000 },
+  buySlip200: { ...DEFAULT_PARAMS, buySlippageBps: 200 },
+  buySlip1000: { ...DEFAULT_PARAMS, buySlippageBps: 1000 },
+  mixRealFilter: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual' },
+  mixRealFilterDec: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', entryPriceMode: 'decision' },
+  mixB25: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', minBuyers: 25 },
+  mixB25Sell: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', minBuyers: 25, sellSlippageBps: 2000 },
+  mixB25SellMax: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', minBuyers: 25, sellSlippageBps: 10000 },
+  mixB20: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', minBuyers: 20 },
+  mixB20SellMax: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', minBuyers: 20, sellSlippageBps: 10000 },
+  mixSellMax: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', sellSlippageBps: 10000 },
+  mixComboB: { ...DEFAULT_PARAMS, priceMode: 'real', exitPriceMode: 'virtual', minBuyers: 25, minNetSol: 5, minAgeSlots: 150, maxRealSol: 15 },
+  prNoTrail: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 1.0 },
+  prNoTrailB25: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, trailingDropPct: 1.0 },
+  prNoTrailB25Sell: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, trailingDropPct: 1.0, sellSlippageBps: 10000 },
+  prTrail050: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.5 },
+  prTrail060: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.6 },
+  prTrail015: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.15 },
+  prTrailArm20: { ...DEFAULT_PARAMS, priceMode: 'real', trailArmPct: 0.2 },
+  prTrailArm10: { ...DEFAULT_PARAMS, priceMode: 'real', trailArmPct: 0.1 },
+  prTrailArm50: { ...DEFAULT_PARAMS, priceMode: 'real', trailArmPct: 0.5 },
+  prTrailArm20B25: { ...DEFAULT_PARAMS, priceMode: 'real', trailArmPct: 0.2, minBuyers: 25, sellSlippageBps: 10000 },
+  noTrailV: { ...DEFAULT_PARAMS, trailingDropPct: 1.0 },
+  prNoTrailSell: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 1.0, sellSlippageBps: 10000 },
+  prStop020: { ...DEFAULT_PARAMS, priceMode: 'real', stopLossPct: 0.2 },
+  prStop025: { ...DEFAULT_PARAMS, priceMode: 'real', stopLossPct: 0.25 },
+  prStop005: { ...DEFAULT_PARAMS, priceMode: 'real', stopLossPct: 0.05 },
+  prTp150: { ...DEFAULT_PARAMS, priceMode: 'real', takeProfitPct: 1.5 },
+  prTp200: { ...DEFAULT_PARAMS, priceMode: 'real', takeProfitPct: 2.0 },
+  prStaleF: { ...DEFAULT_PARAMS, priceMode: 'real', staleSlots: 600 },
+  prNoStaleF: { ...DEFAULT_PARAMS, priceMode: 'real', staleSlots: 100000 },
+  prHoldF1000: { ...DEFAULT_PARAMS, priceMode: 'real', maxHoldSlots: 1000 },
+  prHoldF2500: { ...DEFAULT_PARAMS, priceMode: 'real', maxHoldSlots: 2500 },
+  prTrail025: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.25 },
+  prTrail035: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.35 },
+  prTrail020b: { ...DEFAULT_PARAMS, priceMode: 'real', trailingDropPct: 0.2 },
+  prB25T025: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, trailingDropPct: 0.25, sellSlippageBps: 10000 },
+  prB25T035: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, trailingDropPct: 0.35, sellSlippageBps: 10000 },
+  prB25S020: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, stopLossPct: 0.2, sellSlippageBps: 10000 },
+  prB25T025S020: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, trailingDropPct: 0.25, stopLossPct: 0.2, sellSlippageBps: 10000 },
+  // --- real-exit sweeps on top of prBuyers25SellMax (best so far: -0.0168) ---
+  qT020: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.2 },
+  qT025: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.25 },
+  qT035: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35 },
+  qT040: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.4 },
+  qT100: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 1.0 },
+  qS005: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, stopLossPct: 0.05 },
+  qS008: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, stopLossPct: 0.08 },
+  qS015: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, stopLossPct: 0.15 },
+  qS020: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, stopLossPct: 0.2 },
+  qP050: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, takeProfitPct: 0.5 },
+  qP100: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, takeProfitPct: 1.0 },
+  qP150: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, takeProfitPct: 1.5 },
+  qStale600: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, staleSlots: 600 },
+  qNoStale: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, staleSlots: 100000 },
+  qHold1000: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, maxHoldSlots: 1000 },
+  qHold2500: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, maxHoldSlots: 2500 },
+  qArm10: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailArmPct: 0.1 },
+  qArm20: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailArmPct: 0.2 },
+  qAge150: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, minAgeSlots: 150 },
+  qNet5: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, minNetSol: 5 },
+  qCap15: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, maxRealSol: 15 },
+  qVs90: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, minPriceVsHigh: 0.9 },
+  qShare30: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, maxSingleBuyerShare: 0.3 },
+  qStake001: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, stakeSol: 0.01 },
+  qStake002: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, stakeSol: 0.02 },
+  r1: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3 },
+  r2: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, takeProfitPct: 1.5 },
+  r3: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, takeProfitPct: 1.5, maxHoldSlots: 1000 },
+  r4: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.01 },
+  r5: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, takeProfitPct: 1.5, maxHoldSlots: 1000, stakeSol: 0.01 },
+  r6: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.4, maxSingleBuyerShare: 0.3 },
+  r7: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3 },
+  r8: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.25 },
+  r9: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 20, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3 },
+  r10: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stopLossPct: 0.15 },
+  r11: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, minNetSol: 5 },
+  r12: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 25, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, takeProfitPct: 2.0 },
+  s1: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, takeProfitPct: 0.5 },
+  s2: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.3, maxSingleBuyerShare: 0.3 },
+  s3: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.4, maxSingleBuyerShare: 0.3 },
+  s4: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 35, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3 },
+  s5: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 28, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3 },
+  s6: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.25 },
+  s7: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.35 },
+  s8: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stopLossPct: 0.08 },
+  s9: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stopLossPct: 0.15 },
+  s10: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.01 },
+  s11: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.02 },
+  s12: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, minNetSol: 5 },
+  s13: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, minAgeSlots: 150 },
+  s14: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, maxRealSol: 15 },
+  s15: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, maxHoldSlots: 1000 },
+  s16: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, staleSlots: 600 },
+  t1: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.02, staleSlots: 600 },
+  t2: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.02, staleSlots: 600, maxHoldSlots: 1000 },
+  t3: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.03 },
+  t4: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.025 },
+  t5: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.35, stakeSol: 0.02 },
+  t6: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.02, stopLossPct: 0.08 },
+  t7: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.4, maxSingleBuyerShare: 0.3, stakeSol: 0.02, staleSlots: 600 },
+  t8: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.02, staleSlots: 600, stopLossPct: 0.08 },
+  u1: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.04 },
+  u2: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.05 },
+  u3: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.03, staleSlots: 600 },
+  u4: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.04, staleSlots: 600 },
+  u5: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.4, maxSingleBuyerShare: 0.3, stakeSol: 0.03 },
+  u6: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.4, maxSingleBuyerShare: 0.3, stakeSol: 0.03, staleSlots: 600 },
+  u7: { ...DEFAULT_PARAMS, priceMode: 'real', minBuyers: 30, sellSlippageBps: 10000, trailingDropPct: 0.35, maxSingleBuyerShare: 0.3, stakeSol: 0.03, minNetSol: 5 },
 };
 
-const LAMPORTS = 1e9;
-const CURVE_FEE = 0.0125;
+const LAMPORTS_PER_SOL = 1_000_000_000n;
 
-interface TradeTick {
-  slot: number;
-  buy: boolean;
-  sol: number;
-  user: Pubkey;
-}
-
-interface Tape {
-  created: number | null;
-  creator: Pubkey | null;
-  devSold: boolean;
-  trades: number;
-  buySol: number;
-  sellSol: number;
-  buyers: Map<Pubkey, number>;
-  topBuy: number;
-  high: number;
-  lastPrice: number;
-  lastRqSol: number;
+interface CoinFlow {
+  creator: string;
+  createdSlot: number;
+  buyers: Map<string, bigint>;
+  buyVolumeLamports: bigint;
+  netLamports: bigint;
+  highPrice: number;
+  creatorSold: boolean;
   lastTradeSlot: number;
-  entered: boolean;
-  recent: TradeTick[];
 }
 
 interface Held {
-  opened: number;
-  peakValue: number;
-  invested: number;
-  exiting: boolean;
-  filled: boolean;
-  devSoldAtOpen: boolean;
-  tookTp: boolean;
+  entryPrice: number;
+  peakPrice: number;
+  entrySlot: number;
 }
 
-export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
-  const tapes = new Map<Pubkey, Tape>();
-  const held = new Map<Pubkey, Held>();
+function markPrice(vq: bigint, vt: bigint): number {
+  if (vt <= 0n) return 0;
+  return Number(vq) / Number(vt);
+}
 
-  const tapeOf = (mint: Pubkey): Tape => {
-    let t = tapes.get(mint);
-    if (t === undefined) {
-      t = {
-        created: null, creator: null, devSold: false, trades: 0,
-        buySol: 0, sellSol: 0, buyers: new Map(), topBuy: 0,
-        high: 0, lastPrice: 0, lastRqSol: 0, lastTradeSlot: -1,
-        entered: false, recent: [],
+// Price of a curve under the strategy's price mode. Virtual reserves give
+// the execution price; real reserves give a sharper, undamped price.
+function priceOf(
+  mode: 'virtual' | 'real',
+  vq: bigint,
+  vt: bigint,
+  rq: bigint,
+  rt: bigint,
+): number {
+  if (mode === 'real') {
+    if (rt <= 0n) return 0;
+    return Number(rq) / Number(rt);
+  }
+  return markPrice(vq, vt);
+}
+
+function currentRealPrice(state: BotState, mint: string): number {
+  const curve = state.curves.get(mint);
+  if (curve === undefined) return 0;
+  return priceOf('real', curve.virtual_quote_reserves, curve.virtual_token_reserves, curve.real_quote_reserves, curve.real_token_reserves);
+}
+
+function currentExitPrice(state: BotState, mint: string): number {
+  const curve = state.curves.get(mint);
+  if (curve === undefined) return 0;
+  return priceOf('virtual', curve.virtual_quote_reserves, curve.virtual_token_reserves, curve.real_quote_reserves, curve.real_token_reserves);
+}
+
+export function createStrategy(params: SurvivorParams = DEFAULT_PARAMS): Bot {
+  const flows = new Map<string, CoinFlow>();
+  const held = new Map<string, Held>();
+  const bought = new Set<string>();
+  const pendingBuys = new Set<string>();
+  const pendingSells = new Set<string>();
+  // Decision-time entry price per mint with a buy in flight (only used
+  // when entryPriceMode is 'decision').
+  const pendingEntry = new Map<string, { price: number; slot: number }>();
+  // Coins that pass every flow check but are still too young: re-check
+  // their age each batch (their flow numbers only change on a trade).
+  const waiting = new Set<string>();
+
+  function flowFor(mint: string, creator: string, slot: number): CoinFlow {
+    let f = flows.get(mint);
+    if (f === undefined) {
+      f = {
+        creator,
+        createdSlot: slot,
+        buyers: new Map(),
+        buyVolumeLamports: 0n,
+        netLamports: 0n,
+        highPrice: 0,
+        creatorSold: false,
+        lastTradeSlot: slot,
       };
-      tapes.set(mint, t);
+      flows.set(mint, f);
     }
-    return t;
-  };
+    return f;
+  }
+
+  function foldEvents(batch: Batch): string[] {
+    // Returns the mints that traded in this batch, first-seen order.
+    const traded: string[] = [];
+    const seen = new Set<string>();
+    for (const e of batch.events) {
+      if (e.event === 'CreateEvent') {
+        const f = flowFor(e.mint, e.creator, e.slot);
+        if (params.ageFrom === 'trade') f.createdSlot = -1;
+      } else if (e.event === 'TradeEvent') {
+        const f = flowFor(e.mint, e.creator, e.slot);
+        if (params.ageFrom === 'trade' && f.createdSlot === -1) f.createdSlot = e.slot;
+        const sol = BigInt(e.sol_amount);
+        if (e.is_buy) {
+          f.buyers.set(e.user, (f.buyers.get(e.user) ?? 0n) + sol);
+          f.buyVolumeLamports += sol;
+          f.netLamports += sol;
+        } else {
+          f.netLamports -= sol;
+          if (e.user === f.creator) f.creatorSold = true;
+        }
+        const p = priceOf(
+          params.priceMode,
+          BigInt(e.virtual_quote_reserves),
+          BigInt(e.virtual_token_reserves),
+          BigInt(e.real_quote_reserves),
+          BigInt(e.real_token_reserves),
+        );
+        if (p > f.highPrice) f.highPrice = p;
+        f.lastTradeSlot = e.slot;
+        if (!seen.has(e.mint)) {
+          seen.add(e.mint);
+          traded.push(e.mint);
+        }
+      } else {
+        // CompleteEvent: nothing to aggregate; the harness closes positions.
+      }
+    }
+    return traded;
+  }
+
+  function syncHeld(state: BotState, batch: Batch): void {
+    for (const fill of batch.fills) {
+      if (fill.side === 'buy' && fill.status === 'filled') {
+        pendingBuys.delete(fill.mint);
+        bought.add(fill.mint);
+        const pos = state.positions.get(fill.mint);
+        if (pos !== undefined && !held.has(fill.mint)) {
+          const decided = pendingEntry.get(fill.mint);
+          // Entry and exit prices must be in the same units: in real-price
+          // exit mode the entry is the decision-time real price, never the
+          // (virtual-unit) cost basis.
+          const entry =
+            (params.exitPriceMode ?? params.priceMode) === 'real'
+              ? (decided?.price ?? currentRealPrice(state, fill.mint))
+              : params.entryPriceMode === 'decision' && decided !== undefined
+                ? decided.price
+                : Number(pos.cost_lamports) / Number(pos.token_amount);
+          const slot = decided !== undefined ? decided.slot : fill.slot;
+          held.set(fill.mint, { entryPrice: entry, peakPrice: entry, entrySlot: slot });
+        }
+        pendingEntry.delete(fill.mint);
+      } else if (fill.side === 'buy' && fill.status !== 'filled') {
+        pendingBuys.delete(fill.mint);
+        pendingEntry.delete(fill.mint);
+      } else if (fill.side === 'sell') {
+        pendingSells.delete(fill.mint);
+        if (fill.status === 'filled') held.delete(fill.mint);
+      }
+    }
+    // Reconcile with the account: a position with no entry record (its fill
+    // arrived in a batch we did not see, or a harness close) gets one from
+    // its cost basis; a held coin with no position is gone.
+    for (const [mint, pos] of state.positions) {
+      if (!held.has(mint)) {
+        const entry =
+          (params.exitPriceMode ?? params.priceMode) === 'real'
+            ? currentRealPrice(state, mint)
+            : Number(pos.cost_lamports) / Number(pos.token_amount);
+        held.set(mint, { entryPrice: entry, peakPrice: entry, entrySlot: batch.slot });
+      }
+    }
+    for (const mint of [...held.keys()]) {
+      if (!state.positions.has(mint)) held.delete(mint);
+    }
+  }
+
+  function flowChecks(mint: string, state: BotState): 'ok' | 'young' | 'no' {
+    const f = flows.get(mint);
+    const curve = state.curves.get(mint);
+    if (f === undefined || curve === undefined || curve.complete) return 'no';
+    if (bought.has(mint) || held.has(mint) || pendingBuys.has(mint)) return 'no';
+    const rqSol = Number(curve.real_quote_reserves) / 1e9;
+    if (rqSol < params.minRealSol || rqSol > params.maxRealSol) return 'no';
+    if (f.buyers.size < params.minBuyers) return 'no';
+    if (Number(f.netLamports) / 1e9 < params.minNetSol) return 'no';
+    if (f.buyVolumeLamports > 0n) {
+      let top = 0n;
+      for (const v of f.buyers.values()) if (v > top) top = v;
+      if (Number(top) / Number(f.buyVolumeLamports) > params.maxSingleBuyerShare) return 'no';
+    }
+    if (f.creatorSold) return 'no';
+    const price = priceOf(
+      params.priceMode,
+      curve.virtual_quote_reserves,
+      curve.virtual_token_reserves,
+      curve.real_quote_reserves,
+      curve.real_token_reserves,
+    );
+    if (f.highPrice <= 0 || price < params.minPriceVsHigh * f.highPrice) return 'no';
+    if (state.slot - f.createdSlot < params.minAgeSlots) return 'young';
+    return 'ok';
+  }
 
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
-      const now = batch.slot;
-      const traded = new Set<Pubkey>();
-      for (const e of batch.events) {
-        if (e.event === 'CreateEvent') {
-          const t = tapeOf(e.mint);
-          t.created = e.slot;
-          t.creator = e.creator;
-        } else if (e.event === 'TradeEvent') {
-          const t = tapeOf(e.mint);
-          const sol = Number(e.sol_amount) / LAMPORTS;
-          const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-          t.trades++;
-          t.lastPrice = price;
-          t.lastRqSol = Number(e.real_quote_reserves) / LAMPORTS;
-          t.lastTradeSlot = e.slot;
-          if (price > t.high) t.high = price;
-          t.recent.push({ slot: e.slot, buy: e.is_buy, sol, user: e.user });
-          if (e.is_buy) {
-            t.buySol += sol;
-            const prev = t.buyers.get(e.user) ?? 0;
-            t.buyers.set(e.user, prev + sol);
-            if (prev + sol > t.topBuy) t.topBuy = prev + sol;
-          } else {
-            t.sellSol += sol;
-            if (t.creator !== null && e.user === t.creator) t.devSold = true;
-          }
-          traded.add(e.mint);
+      const traded = foldEvents(batch);
+      syncHeld(state, batch);
+      const orders: OrderInput[] = [];
+      const txFee = state.txFeeLamports();
+
+      // --- exits, sells first, sorted by mint for determinism ---
+      for (const mint of [...held.keys()].sort()) {
+        if (pendingSells.has(mint)) continue;
+        const h = held.get(mint)!;
+        const curve = state.curves.get(mint);
+        const pos = state.positions.get(mint);
+        if (curve === undefined || pos === undefined || curve.complete) continue;
+        const price = priceOf(
+          params.exitPriceMode ?? params.priceMode,
+          curve.virtual_quote_reserves,
+          curve.virtual_token_reserves,
+          curve.real_quote_reserves,
+          curve.real_token_reserves,
+        );
+        if (price <= 0) continue;
+        if (price > h.peakPrice) h.peakPrice = price;
+        const f = flows.get(mint);
+        const ret = price / h.entryPrice - 1;
+        const stale = f !== undefined && state.slot - f.lastTradeSlot >= params.staleSlots;
+        const creatorSold = f !== undefined && f.creatorSold;
+        const tooLong = state.slot - h.entrySlot >= params.maxHoldSlots;
+        const armed = h.peakPrice >= h.entryPrice * (1 + (params.trailArmPct ?? 0));
+        const trailed = armed && price <= h.peakPrice * (1 - params.trailingDropPct);
+        if (
+          ret <= -params.stopLossPct ||
+          ret >= params.takeProfitPct ||
+          trailed ||
+          creatorSold ||
+          stale ||
+          tooLong
+        ) {
+          orders.push({
+            side: 'sell',
+            mint,
+            token_amount: pos.token_amount,
+            max_slippage_bps: params.sellSlippageBps ?? params.maxSlippageBps,
+          });
+          pendingSells.add(mint);
         }
       }
 
-      const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
-      const pendingByMint = new Map<Pubkey, number>();
-      for (const po of state.pending.values()) {
-        pendingByMint.set(po.order.mint, (pendingByMint.get(po.order.mint) ?? 0) + 1);
-      }
-      const orders: OrderInput[] = [];
-      const cap = state.hello.caps.max_orders_per_batch;
-      const tx = Number(state.txFeeLamports()) / LAMPORTS;
-
-      // Exits first, held mints in sorted order (deterministic).
-      for (const mint of [...held.keys()].sort()) {
-        if (orders.length >= cap) break;
-        const h = held.get(mint)!;
-        const pos = state.positions.get(mint);
-        const curve = state.curves.get(mint);
-        if (pos === undefined) {
-          if (!pendingByMint.has(mint)) held.delete(mint);
+      // --- entries: coins that traded now, plus young ones waiting on age ---
+      const candidates = new Set<string>(traded);
+      for (const mint of waiting) candidates.add(mint);
+      const stake = BigInt(Math.round(params.stakeSol * 1e9));
+      for (const mint of candidates) {
+        if (orders.length >= 16) break;
+        const verdict = flowChecks(mint, state);
+        if (verdict === 'young') {
+          waiting.add(mint);
           continue;
         }
-        h.filled = true;
-        if (curve === undefined || curve.complete) continue;
-        const mk = marks.get(mint);
-        const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
-        const vt = mk ? Number(mk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
-        const tokens = Number(pos.token_amount);
-        const value = ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - tx;
-        const cost = Number(pos.cost_lamports) / LAMPORTS;
-        if (value > h.peakValue) h.peakValue = value;
-        // Partial take-profit first: bank half at tp1, let the rest ride.
-        // The sim reduces cost pro-rata on a partial sell, so later exits
-        // compare against the remainder's cost; reset the peak so the
-        // trailing stop arms off the post-TP value, not the pre-TP peak.
-        if (!h.tookTp && p.tp1Part > 0 && value >= cost * (1 + p.tp1)) {
-          let sellPending = false;
-          for (const po of state.pending.values()) {
-            if (po.order.mint === mint && po.order.side === 'sell') sellPending = true;
-          }
-          if (!sellPending && orders.length < cap) {
-            const sellTokens = BigInt(pos.token_amount) * BigInt(Math.round(p.tp1Part * 10000)) / 10000n;
-            if (sellTokens > 0n && sellTokens < BigInt(pos.token_amount)) {
-              orders.push({ side: 'sell', mint, token_amount: sellTokens, max_slippage_bps: 10_000 });
-              h.tookTp = true;
-              // Re-arm the trailing stop from the post-TP values.
-              h.peakValue = 0;
-              continue;
-            }
-          }
-        }
-        let exit = h.exiting;
-        const t = tapeOf(mint);
-        if (!exit && value < cost * (1 - p.stopLoss)) exit = true;
-        if (!exit && h.peakValue >= cost * (1 + p.trailArm) && value < h.peakValue * (1 - p.trail)) exit = true;
-        if (!exit && value >= cost * (1 + p.takeProfit)) exit = true;
-        if (!exit && now - h.opened > p.maxHold) exit = true;
-        if (!exit && p.exitOnDevSell && t.devSold && !h.devSoldAtOpen) exit = true;
-        if (!exit && now - t.lastTradeSlot > p.staleSlots) exit = true;
-        if (!exit) continue;
-        h.exiting = true;
-        let sellPending = false;
-        for (const po of state.pending.values()) {
-          if (po.order.mint === mint && po.order.side === 'sell') sellPending = true;
-        }
-        if (sellPending) continue;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
-      }
-
-      // Entries: only coins that traded this batch (their tape just changed).
-      // Candidates are ranked by signal strength (net inflow, then buyers)
-      // and the strongest take the scarce position slots first: during hot
-      // bursts many coins trigger at once and first-come-first-served
-      // spends slots on whichever the batch order lists first.
-      let free = Number(state.freeCashLamports()) / LAMPORTS;
-      let slotsLeft = Math.min(
-        state.hello.caps.max_open_positions - state.committedPositionCount(),
-        p.maxMain - held.size,
-      );
-      let exposure = 0;
-      for (const [mint, h] of held) {
-        exposure += Math.max(h.invested, Number(state.positions.get(mint)?.cost_lamports ?? 0n) / LAMPORTS);
-      }
-      const candidates: { mint: Pubkey; net: number; buyers: number }[] = [];
-      for (const mint of traded) {
+        waiting.delete(mint);
+        if (verdict !== 'ok') continue;
+        if (state.committedPositionCount() + orders.filter((o) => o.side === 'buy').length >= 5) break;
+        const cap = state.maxBuyLamports(mint);
+        const spend = stake < cap ? stake : cap;
+        if (spend <= txFee) continue;
+        if (state.freeCashLamports() - BigInt(orders.filter((o) => o.side === 'buy').length) * (stake + txFee) < spend + txFee) continue;
+        orders.push({ side: 'buy', mint, quote_lamports: spend, max_slippage_bps: params.buySlippageBps ?? params.maxSlippageBps });
+        bought.add(mint);
+        pendingBuys.add(mint);
         const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) continue;
-        if (pendingByMint.has(mint) || held.has(mint)) continue;
-        const t = tapes.get(mint)!;
-        if (t.entered || t.created === null) continue;
-        const age = now - t.created;
-        if (age < p.minAge || age > p.maxAge) continue;
-        if (t.devSold && p.skipDevSold) continue;
-        const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-        if (rqSol < p.minRqSol || rqSol > p.maxRqSol) continue;
-        if (t.buyers.size < p.minBuyers) continue;
-        const net = t.buySol - t.sellSol;
-        if (net < p.minNetSol) continue;
-        if (t.buySol > 0 && t.topBuy > p.maxTopBuyerShare * t.buySol) continue;
-        if (t.high <= 0 || t.lastPrice < t.high * p.minNearHigh) continue;
-        if (t.lastPrice > t.high * p.maxNearHigh) continue;
-        if (p.minRecentFlowSol > 0 || p.minRecentBuyers > 0) {
-          let cut = 0;
-          while (cut < t.recent.length && t.recent[cut]!.slot <= now - p.flowWindow) cut++;
-          if (cut > 0) t.recent.splice(0, cut);
-          let flow = 0;
-          const recentBuyers = new Set<Pubkey>();
-          for (const tk of t.recent) {
-            flow += tk.buy ? tk.sol : -tk.sol;
-            if (tk.buy) recentBuyers.add(tk.user);
-          }
-          if (flow < p.minRecentFlowSol) continue;
-          if (recentBuyers.size < p.minRecentBuyers) continue;
+        if (curve !== undefined) {
+          pendingEntry.set(mint, {
+            price: priceOf(
+              params.exitPriceMode ?? params.priceMode,
+              curve.virtual_quote_reserves,
+              curve.virtual_token_reserves,
+              curve.real_quote_reserves,
+              curve.real_token_reserves,
+            ),
+            slot: batch.slot,
+          });
         }
-        candidates.push({ mint, net, buyers: t.buyers.size });
-      }
-      candidates.sort((a, b) => (b.net - a.net) || (b.buyers - a.buyers) || (a.mint < b.mint ? -1 : 1));
-      for (const { mint } of candidates) {
-        if (orders.length >= cap) break;
-        if (slotsLeft <= 0) break;
-        const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) continue;
-        const t = tapes.get(mint)!;
-        const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
-        let amount = Math.min(capSol, p.stakeSol, p.maxExposureSol - exposure);
-        if (amount > free - tx) amount = free - tx;
-        if (amount < p.minBuySol) continue;
-        const lamports = BigInt(Math.floor(amount * LAMPORTS));
-        orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: p.buySlipBps });
-        free -= amount + tx;
-        exposure += amount;
-        held.set(mint, {
-          opened: now, peakValue: 0, invested: amount,
-          exiting: false, filled: false, devSoldAtOpen: t.devSold,
-          tookTp: false,
-        });
-        t.entered = true;
-        slotsLeft--;
       }
       return orders;
     },
